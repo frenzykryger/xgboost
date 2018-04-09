@@ -16,9 +16,10 @@
 
 package ml.dmlc.xgboost4j.scala.spark.params
 
+import ml.dmlc.xgboost4j.LabeledPoint
 import ml.dmlc.xgboost4j.scala.spark.TrackerConf
-
 import org.apache.spark.ml.param._
+import org.apache.spark.rdd.RDD
 
 trait GeneralParams extends Params {
 

@@ -19,8 +19,6 @@ package ml.dmlc.xgboost4j.scala.spark
 import java.io.File
 import java.nio.file.Files
 
-import scala.collection.mutable
-import scala.util.Random
 import ml.dmlc.xgboost4j.java.{IRabitTracker, Rabit, XGBoostError, RabitTracker => PyRabitTracker}
 import ml.dmlc.xgboost4j.scala.rabit.RabitTracker
 import ml.dmlc.xgboost4j.scala.{XGBoost => SXGBoost, _}
@@ -28,10 +26,13 @@ import ml.dmlc.xgboost4j.{LabeledPoint => XGBLabeledPoint}
 import org.apache.commons.io.FileUtils
 import org.apache.commons.logging.LogFactory
 import org.apache.hadoop.fs.{FSDataInputStream, Path}
+import org.apache.spark.ml.feature.{LabeledPoint => MLLabeledPoint}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.Dataset
-import org.apache.spark.ml.feature.{LabeledPoint => MLLabeledPoint}
 import org.apache.spark.{SparkContext, SparkParallelismTracker, TaskContext}
+
+import scala.collection.mutable
+import scala.util.Random
 
 
 /**
@@ -105,6 +106,7 @@ object XGBoost extends Serializable {
       round: Int,
       obj: ObjectiveTrait,
       eval: EvalTrait,
+      evalSet: Option[RDD[XGBLabeledPoint]] = None,
       useExternalMemory: Boolean,
       missing: Float,
       prevBooster: Booster
@@ -129,8 +131,10 @@ object XGBoost extends Serializable {
       }
       rabitEnv.put("DMLC_TASK_ID", taskId)
       Rabit.init(rabitEnv)
+
       val watches = Watches(params,
         removeMissingValues(labeledPoints, missing),
+        removeMissingValues(evalSet.map(_.toLocalIterator).getOrElse(Iterator.empty), missing),
         fromBaseMarginsToArray(baseMargins), cacheDirName)
 
       try {
@@ -226,9 +230,11 @@ object XGBoost extends Serializable {
       nWorkers: Int,
       obj: ObjectiveTrait = null,
       eval: EvalTrait = null,
+      evalSet: Option[RDD[MLLabeledPoint]] = None,
       useExternalMemory: Boolean = false,
       missing: Float = Float.NaN): XGBoostModel = {
-    trainWithRDD(trainingData, params, round, nWorkers, obj, eval, useExternalMemory, missing)
+    trainWithRDD(trainingData, params, round, nWorkers, obj, eval, evalSet,
+      useExternalMemory, missing)
   }
 
   private def overrideParamsAccordingToTaskCPUs(
@@ -282,13 +288,17 @@ object XGBoost extends Serializable {
       nWorkers: Int,
       obj: ObjectiveTrait = null,
       eval: EvalTrait = null,
+      evalSet: Option[RDD[MLLabeledPoint]] = None,
       useExternalMemory: Boolean = false,
       missing: Float = Float.NaN): XGBoostModel = {
     import DataUtils._
     val xgbTrainingData = trainingData.map { case MLLabeledPoint(label, features) =>
       features.asXGB.copy(label = label.toFloat)
     }
-    trainDistributed(xgbTrainingData, params, round, nWorkers, obj, eval,
+    val xgbEvalSet = evalSet.map(rdd => rdd.map { case MLLabeledPoint(label, features) =>
+      features.asXGB.copy(label = label.toFloat)
+    })
+    trainDistributed(xgbTrainingData, params, round, nWorkers, obj, eval, xgbEvalSet,
       useExternalMemory, missing)
   }
 
@@ -300,6 +310,7 @@ object XGBoost extends Serializable {
       nWorkers: Int,
       obj: ObjectiveTrait = null,
       eval: EvalTrait = null,
+      evalSet: Option[RDD[XGBLabeledPoint]] = None,
       useExternalMemory: Boolean = false,
       missing: Float = Float.NaN): XGBoostModel = {
     if (params.contains("tree_method")) {
@@ -340,7 +351,7 @@ object XGBoost extends Serializable {
           val parallelismTracker = new SparkParallelismTracker(sc, timeoutRequestWorkers, nWorkers)
           val overriddenParams = overrideParamsAccordingToTaskCPUs(params, sc)
           val boostersAndMetrics = buildDistributedBoosters(partitionedData, overriddenParams,
-            tracker.getWorkerEnvs, checkpointRound, obj, eval, useExternalMemory, missing,
+            tracker.getWorkerEnvs, checkpointRound, obj, eval, evalSet, useExternalMemory, missing,
             prevBooster)
           val sparkJobThread = new Thread() {
             override def run() {
@@ -492,22 +503,21 @@ private object Watches {
   def apply(
       params: Map[String, Any],
       labeledPoints: Iterator[XGBLabeledPoint],
+      evalSet: Iterator[XGBLabeledPoint],
       baseMarginsOpt: Option[Array[Float]],
       cacheDirName: Option[String]): Watches = {
-    val trainTestRatio = params.get("trainTestRatio").map(_.toString.toDouble).getOrElse(1.0)
     val seed = params.get("seed").map(_.toString.toLong).getOrElse(System.nanoTime())
     val r = new Random(seed)
-    val testPoints = mutable.ArrayBuffer.empty[XGBLabeledPoint]
-    val trainPoints = labeledPoints.filter { labeledPoint =>
-      val accepted = r.nextDouble() <= trainTestRatio
-      if (!accepted) {
-        testPoints += labeledPoint
-      }
+    val trainTestRatio = params.get("trainTestRatio").map(_.toString.toDouble).getOrElse(1.0)
 
-      accepted
+    val (trainIter, testIter) = if (evalSet.hasNext) {
+      (labeledPoints, evalSet)
+    } else {
+      labeledPoints.partition(_ => r.nextDouble() <= trainTestRatio)
     }
-    val trainMatrix = new DMatrix(trainPoints, cacheDirName.map(_ + "/train").orNull)
-    val testMatrix = new DMatrix(testPoints.iterator, cacheDirName.map(_ + "/test").orNull)
+
+    val trainMatrix = new DMatrix(trainIter, cacheDirName.map(_ + "/train").orNull)
+    val testMatrix = new DMatrix(testIter, cacheDirName.map(_ + "/test").orNull)
     r.setSeed(seed)
     for (baseMargins <- baseMarginsOpt) {
       val (trainMargin, testMargin) = baseMargins.partition(_ => r.nextDouble() <= trainTestRatio)

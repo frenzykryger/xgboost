@@ -16,11 +16,8 @@
 
 package ml.dmlc.xgboost4j.scala.spark
 
-import scala.collection.mutable
-
 import ml.dmlc.xgboost4j.scala.spark.params._
 import ml.dmlc.xgboost4j.{LabeledPoint => XGBLabeledPoint}
-
 import org.apache.spark.ml.Predictor
 import org.apache.spark.ml.linalg.{DenseVector, SparseVector, Vector}
 import org.apache.spark.ml.param._
@@ -30,16 +27,23 @@ import org.apache.spark.sql.types.FloatType
 import org.apache.spark.sql.{Dataset, Row}
 import org.json4s.DefaultFormats
 
+import scala.collection.mutable
+
 /**
  * XGBoost Estimator to produce a XGBoost model
  */
 class XGBoostEstimator private[spark](
-  override val uid: String, xgboostParams: Map[String, Any])
+  override val uid: String, xgboostParams: Map[String, Any], evalSet: Option[Dataset[_]] = None)
   extends Predictor[Vector, XGBoostEstimator, XGBoostModel]
   with LearningTaskParams with GeneralParams with BoosterParams with MLWritable {
 
-  def this(xgboostParams: Map[String, Any]) =
-    this(Identifiable.randomUID("XGBoostEstimator"), xgboostParams: Map[String, Any])
+  def this(xgboostParams: Map[String, Any], evalSet: Option[Dataset[_]]) = {
+    this(Identifiable.randomUID("XGBoostEstimator"), xgboostParams: Map[String, Any], evalSet)
+  }
+
+  def this(xgboostParams: Map[String, Any]) = {
+    this(xgboostParams: Map[String, Any], None)
+  }
 
   def this(uid: String) = this(uid, Map[String, Any]())
 
@@ -92,6 +96,22 @@ class XGBoostEstimator private[spark](
     }
   }
 
+  private def toLabeledPoints(df: Dataset[_]) = {
+    val instances = ensureColumns(df).select(
+      col($(featuresCol)),
+      col($(labelCol)).cast(FloatType),
+      col($(baseMarginCol)).cast(FloatType),
+      col($(weightCol)).cast(FloatType)
+    ).rdd.map { case Row(features: Vector, label: Float, baseMargin: Float, weight: Float) =>
+      val (indices, values) = features match {
+        case v: SparseVector => (v.indices, v.values.map(_.toFloat))
+        case v: DenseVector => (null, v.values.map(_.toFloat))
+      }
+      XGBLabeledPoint(label.toFloat, indices, values, baseMargin = baseMargin, weight = weight)
+    }
+    instances
+  }
+
   fromXGBParamMapToParams()
 
   private[spark] def fromParamsToXGBParamMap: Map[String, Any] = {
@@ -122,23 +142,13 @@ class XGBoostEstimator private[spark](
    * produce a XGBoostModel by fitting the given dataset
    */
   override def train(trainingSet: Dataset[_]): XGBoostModel = {
-    val instances = ensureColumns(trainingSet).select(
-      col($(featuresCol)),
-      col($(labelCol)).cast(FloatType),
-      col($(baseMarginCol)).cast(FloatType),
-      col($(weightCol)).cast(FloatType)
-    ).rdd.map { case Row(features: Vector, label: Float, baseMargin: Float, weight: Float) =>
-      val (indices, values) = features match {
-        case v: SparseVector => (v.indices, v.values.map(_.toFloat))
-        case v: DenseVector => (null, v.values.map(_.toFloat))
-      }
-      XGBLabeledPoint(label.toFloat, indices, values, baseMargin = baseMargin, weight = weight)
-    }
+    val instances = toLabeledPoints(trainingSet)
+
     transformSchema(trainingSet.schema, logging = true)
     val derivedXGBoosterParamMap = fromParamsToXGBParamMap
     val trainedModel = XGBoost.trainDistributed(instances, derivedXGBoosterParamMap,
-      $(round), $(nWorkers), $(customObj), $(customEval), $(useExternalMemory),
-      $(missing)).setParent(this)
+      $(round), $(nWorkers), $(customObj), $(customEval),
+      evalSet.map(toLabeledPoints), $(useExternalMemory), $(missing)).setParent(this)
     val returnedModel = copyValues(trainedModel, extractParamMap())
     if (XGBoost.isClassificationTask(derivedXGBoosterParamMap)) {
       returnedModel.asInstanceOf[XGBoostClassificationModel].numOfClasses = $(numClasses)
